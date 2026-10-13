@@ -2,7 +2,7 @@ name: Parsers
 
 on:
   schedule:
-    - cron: '6 * * * *'
+    - cron: '*/2 * * * *'
   workflow_dispatch:
 jobs:
   run:

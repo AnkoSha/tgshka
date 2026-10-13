@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from google.oauth2.service_account import Credentials
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import PeerChannel
 import asyncio
 import nest_asyncio
 

@@ -3,3 +3,6 @@ gspread
 google-auth
 nest_asyncio
 pysocks
+beautifulsoup4
+pandas
+requests

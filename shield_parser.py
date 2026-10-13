@@ -107,14 +107,25 @@ def _get_version(base, slug):
     return m.group(1) if m else None
 
 
-def _download_json(base, slug, v):
+def _download_json(base, slug, v, hard_max_bytes=None):
+    """
+    Качает JSON до hard_max_bytes (или HARD_MAX_BYTES).
+    Возвращает самый полный из полученных ответов.
+    """
+    if hard_max_bytes is None:
+        hard_max_bytes = HARD_MAX_BYTES
+
     url = f'{base}/sheet-data.php?sheet={slug}'
     if v:
         url += f'&v={v}'
+
     best = ''
+    best_len = 0
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         total = 0
         buf = bytearray()
+        t0 = time.time()
         try:
             with SESSION.get(url, timeout=(10, READ_TIMEOUT), stream=True) as r:
                 r.raise_for_status()
@@ -123,17 +134,30 @@ def _download_json(base, slug, v):
                         continue
                     buf.extend(c)
                     total += len(c)
-                    if total >= HARD_MAX_BYTES:
+                    if total >= hard_max_bytes:
                         break
         except Exception as e:
-            logging.warning(f'{PREFIX}: попытка {attempt}: {type(e).__name__} на {total/1e6:.2f} МБ')
-        if total > len(best):
+            logging.warning(
+                f'{PREFIX}: попытка {attempt}: {type(e).__name__} '
+                f'на {total/1e6:.2f} МБ за {time.time()-t0:.1f}с'
+            )
+
+        dt = time.time() - t0
+        logging.info(
+            f'{PREFIX}: попытка {attempt}: {total/1e6:.2f} МБ за {dt:.1f}с'
+        )
+
+        if total > best_len:
             best = bytes(buf).decode('utf-8', errors='ignore')
-        if total >= 10_000_000 and HARD_MAX_BYTES <= 12_500_000:
+            best_len = total
+
+        # Если скачали хотя бы 95% от hard_max_bytes — хватит
+        if total >= hard_max_bytes * 0.95:
+            logging.info(f'{PREFIX}: достаточно ({total/1e6:.2f} МБ)')
             return best
-        if total >= HARD_MAX_BYTES * 0.95:
-            return best
+
         time.sleep(1)
+
     return best
 
 
@@ -166,20 +190,40 @@ def _parse_all_sheets(text, max_rows):
 
 
 def normal_phone(x):
+    """
+    Нормализация номера.
+    РФ: 8XXXXXXXXXX / 7XXXXXXXXXX / 78XXXXXXXXXX → 10 цифр.
+    СНГ и всё остальное: 10-13 цифр → как есть.
+    Длиннее 13 — это уже карты, отсеиваем (None).
+    """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     x = re.sub(r'\D', '', str(x))
+    if not x:
+        return None
+    # РФ форматы
     if len(x) == 11 and x[0] in ('7', '8'):
-        x = x[1:]
-    elif len(x) == 12 and x[:2] == '78':
-        x = x[2:]
-    return x or None
+        return x[1:]
+    if len(x) == 12 and x[:2] == '78':
+        return x[2:]
+    # СНГ и остальные — 10-13 цифр принимаем как есть
+    if 10 <= len(x) <= 13:
+        return x
+    return None
 
 
-def to_standart_phone(value_10):
-    if not value_10 or len(value_10) != 10:
+def to_standart_phone(value):
+    """
+    Стандартизованный номер.
+    Для 10-значных (РФ) — '007'+num.
+    Для СНГ (11-13) — сам номер.
+    """
+    if not value or not str(value).isdigit():
         return ''
-    return '007' + value_10
+    s = str(value)
+    if len(s) == 10:
+        return '007' + s
+    return s
 
 
 COLS_SBP  = ['date_ins', 'phone', 'casino_name', 'url_mirror',
@@ -205,7 +249,8 @@ def setup_sheets():
                 "https://www.googleapis.com/auth/drive"]
     )
     gc = gspread.authorize(creds)
-    ss = gc.open_by_key(SPREADSHEET_ID) if SPREADSHEET_ID else gc.open(os.environ['SPREADSHEET_NAME'])
+    ss = gc.open_by_key(SPREADSHEET_ID) if SPREADSHEET_ID \
+        else gc.open(os.environ['SPREADSHEET_NAME'])
 
     def ensure(name, headers):
         try:
@@ -264,9 +309,12 @@ def _build_rows(rows, kind, parsed_at):
         ).dt.date
 
     if 'fio' in df.columns:
-        df['fio'] = df['fio'].replace(to_replace=r'^http.*$', value=np.nan, regex=True)
+        df['fio'] = df['fio'].replace(
+            to_replace=r'^http.*$', value=np.nan, regex=True
+        )
 
     out = []
+
     if kind == 'card':
         df['card'] = df['card'].astype(str).str.replace(r'\s+', '', regex=True)
         df = df[df['card'].notna() & (df['card'] != '') & (df['card'] != 'nan')]
@@ -283,13 +331,30 @@ def _build_rows(rows, kind, parsed_at):
                 parsed_at,
             ])
     else:
+        # СБП: чистим и нормализуем
         df['phone'] = df['phone'].astype(str).str.replace('[^0-9]', '', regex=True)
         df['value'] = df['phone'].map(normal_phone)
-        df = df[df['value'].notna() & (df['value'].str.len() == 10)]
+
+        before = len(df)
+        # 10-13 цифр — это номер. 14+ — карта (отсеиваем).
+        df = df[df['value'].notna()]
+        df = df[df['value'].str.len().between(10, 13)]
+        logging.info(
+            f'{PREFIX}: {kind}: после нормализации {len(df)}/{before} '
+            f'(длины 10-13)'
+        )
+
+        # лог распределения длин
+        if len(df) > 0:
+            lengths = df['value'].str.len().value_counts().to_dict()
+            logging.info(f'{PREFIX}: {kind}: длины номеров: {lengths}')
+
         for _, r in df.iterrows():
             out.append([
                 str(r['date_ins']) if pd.notna(r['date_ins']) else '',
-                r['phone'], r['value'], to_standart_phone(r['value']),
+                r['phone'],
+                r['value'],
+                to_standart_phone(r['value']),
                 r['casino_name'] or '',
                 r['url_mirror'] or '',
                 r['url_pay_system'] or '',
@@ -305,15 +370,22 @@ def _build_rows(rows, kind, parsed_at):
 def run_shield(force_refresh=False, full=False):
     """
     force_refresh=True — игнорировать v.
-    full=True          — полный дамп без лимитов.
+    full=True          — полный дамп без лимитов (100 МБ, все строки).
     """
     global MAX_ROWS_PER_SHEET, HARD_MAX_BYTES
+
+    saved_rows = MAX_ROWS_PER_SHEET
+    saved_bytes = HARD_MAX_BYTES
+
     if full:
-        MAX_ROWS_PER_SHEET = 50_000
+        MAX_ROWS_PER_SHEET = 500_000
         HARD_MAX_BYTES     = 100_000_000
 
     tag = 'FULL DUMP' if full else ('FORCE' if force_refresh else 'NORMAL')
     logging.info(f'{PREFIX}: === старт ({tag}) ===')
+    logging.info(f'{PREFIX}: MAX_ROWS_PER_SHEET={MAX_ROWS_PER_SHEET}, '
+                 f'HARD_MAX_BYTES={HARD_MAX_BYTES/1e6:.1f} МБ')
+
     try:
         ss, ws_card, ws_sbp, ws_sys = setup_sheets()
 
@@ -328,12 +400,14 @@ def run_shield(force_refresh=False, full=False):
         last_v = sys_get(ws_sys, 'shield_last_v')
         logging.info(f'{PREFIX}: last_v={last_v!r}, current_v={current_v!r}')
 
-        if not force_refresh and not full and current_v is not None and last_v == current_v:
+        if not force_refresh and not full \
+                and current_v is not None and last_v == current_v:
             logging.info(f'{PREFIX}: не менялось, пропуск')
             return
 
-        text = _download_json(base, slug, current_v)
-        logging.info(f'{PREFIX}: скачано {len(text)/1e6:.2f} МБ')
+        text = _download_json(base, slug, current_v,
+                              hard_max_bytes=HARD_MAX_BYTES)
+        logging.info(f'{PREFIX}: скачано {len(text)/1e6:.2f} МБ текста')
         if not text:
             logging.warning(f'{PREFIX}: не удалось скачать')
             return
@@ -360,16 +434,22 @@ def run_shield(force_refresh=False, full=False):
                 if kind is None:
                     logging.warning(f'{PREFIX}/{sh["name"]}: тип не распознан')
                     continue
+
                 rows = _build_rows(sh['rows'], kind, parsed_at)
                 if not rows:
-                    logging.info(f'{PREFIX}/{sh["name"]}: 0 строк после фильтра')
+                    logging.info(
+                        f'{PREFIX}/{sh["name"]} ({kind}): 0 строк после фильтра. '
+                        f'Исходно было {len(sh["rows"])} строк'
+                    )
                     continue
+
                 push_rows(ws_card if kind == 'card' else ws_sbp, rows)
                 if kind == 'card':
                     total_card += len(rows)
                 else:
                     total_sbp += len(rows)
                 logging.info(f'{PREFIX}/{sh["name"]} ({kind}): +{len(rows)}')
+
             except Exception as e:
                 logging.error(f'{PREFIX}/{sh["name"]}: ошибка: {e}')
                 traceback.print_exc()
@@ -378,8 +458,13 @@ def run_shield(force_refresh=False, full=False):
             sys_set(ws_sys, 'shield_last_v', current_v)
 
         logging.info(f'{PREFIX}: ИТОГО card={total_card}, sbp={total_sbp}')
+
     except Exception as e:
         logging.error(f'{PREFIX}: общая ошибка: {e}')
         traceback.print_exc()
+
     finally:
+        # вернуть прежние значения
+        MAX_ROWS_PER_SHEET = saved_rows
+        HARD_MAX_BYTES     = saved_bytes
         logging.info(f'{PREFIX}: === конец ===')

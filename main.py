@@ -19,7 +19,7 @@ GOOGLE_CREDS_RAW = os.environ['GOOGLE_CREDENTIALS']
 SPREADSHEET_ID   = os.environ.get('SPREADSHEET_ID')
 SPREADSHEET_NAME = os.environ.get('SPREADSHEET_NAME')  # fallback
 
-CHANNEL_LINK = '@badbank7'
+CHANNEL_LINK = -1001545069749
 
 # Имена листов
 DATA_SHEET  = 'data'

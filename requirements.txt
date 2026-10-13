@@ -1,0 +1,5 @@
+telethon
+gspread
+google-auth
+nest_asyncio
+pysocks

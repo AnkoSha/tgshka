@@ -12,7 +12,6 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
-# ---------------- ENV ----------------
 API_ID           = int(os.environ['TELEGRAM_API_ID'])
 API_HASH         = os.environ['TELEGRAM_API_HASH']
 SESSION_STRING   = os.environ['TELEGRAM_SESSION']
@@ -36,10 +35,6 @@ MERCH_HEADERS = [
 ]
 SYS_HEADERS = ['key', 'value']
 
-
-# ==========================================================
-#  ПАРСИНГ: КАРТЫ / ТЕЛЕФОНЫ
-# ==========================================================
 
 BANKS = [
     'банк', 'bank', 'сбер', 'альфа', 'тинькофф', 'т-банк', 'т банк',
@@ -74,10 +69,11 @@ STOP_WORDS = ['сайт', 'url', 'пп', 'банк', 'казино', 'casino', '
 
 def to_standart_phone(num: str) -> str:
     digits = re.sub(r'\D', '', num)
-    local = digits[-10:]
-    if len(local) != 10:
+    if not digits:
         return ''
-    return '007' + local
+    if len(digits) < 13:
+        return digits.zfill(13)
+    return digits
 
 
 def parse_message(text):
@@ -148,11 +144,11 @@ def parse_message(text):
             continue
 
         for num in re.findall(r'\d+', line):
-            if len(num) < 10 or len(num) > 16:
+            if len(num) < 10 or len(num) > 19:
                 continue
-            if len(num) == 16:
+            if len(num) >= 13:
                 result['cards'].append((num, current_bank))
-            elif 10 <= len(num) <= 12:
+            else:
                 if num.startswith('8'):
                     num = '7' + num[1:]
                 elif num.startswith('9') and len(num) == 10:
@@ -160,10 +156,6 @@ def parse_message(text):
                 result['phones'].append((num, current_operator))
     return result
 
-
-# ==========================================================
-#  ПАРСИНГ: МЕРЧАНТЫ
-# ==========================================================
 
 RE_RECIPIENT = re.compile(r'(?:Получатель|Получатель\s*платежа|Реквизиты\s*получателя)\s*[:\-]\s*(.+)', re.IGNORECASE)
 RE_LEGAL     = re.compile(r'(?:Наименование\s*ЮЛ|ЮЛ|Юр\.?\s*лицо|Наименование\s*получателя)\s*[:\-]\s*(.+)', re.IGNORECASE)
@@ -203,10 +195,6 @@ def parse_merch(text, message_id):
         })
     return out
 
-
-# ==========================================================
-#  GOOGLE SHEETS
-# ==========================================================
 
 def setup_sheets():
     creds_dict = json.loads(GOOGLE_CREDS_RAW)
@@ -256,10 +244,6 @@ def push_rows(ws, rows):
         return
     ws.append_rows(rows, value_input_option='RAW')
 
-
-# ==========================================================
-#  MAIN
-# ==========================================================
 
 async def run_telegram():
     ss, ws_data, ws_merch, ws_sys = setup_sheets()

@@ -60,6 +60,10 @@ SHIELD_SBP_HEADERS = [
 ]
 SYS_HEADERS = ['key', 'value']
 
+# 1-based индексы колонок для составного ключа уникальности
+CARD_KEY_COLS = [2]        # card
+SBP_KEY_COLS  = [3, 1]     # value | date_ins
+
 
 # ------------- http -------------
 def _get(url, max_attempts=5, read_timeout=READ_TIMEOUT):
@@ -151,7 +155,6 @@ def _download_json(base, slug, v, hard_max_bytes=None):
             best = bytes(buf).decode('utf-8', errors='ignore')
             best_len = total
 
-        # Если скачали хотя бы 95% от hard_max_bytes — хватит
         if total >= hard_max_bytes * 0.95:
             logging.info(f'{PREFIX}: достаточно ({total/1e6:.2f} МБ)')
             return best
@@ -191,10 +194,9 @@ def _parse_all_sheets(text, max_rows):
 
 def normal_phone(x):
     """
-    Нормализация номера.
+    Нормализация номера — только цифры.
     РФ: 8XXXXXXXXXX / 7XXXXXXXXXX / 78XXXXXXXXXX → 10 цифр.
-    СНГ и всё остальное: 10-13 цифр → как есть.
-    Длиннее 13 — это уже карты, отсеиваем (None).
+    Всё остальное до 20 цифр — как есть.
     """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
@@ -206,23 +208,22 @@ def normal_phone(x):
         return x[1:]
     if len(x) == 12 and x[:2] == '78':
         return x[2:]
-    # СНГ и остальные — 10-13 цифр принимаем как есть
-    if 10 <= len(x) <= 13:
+    # всё остальное похожее на номер
+    if len(x) <= 20:
         return x
     return None
 
 
 def to_standart_phone(value):
     """
-    Стандартизованный номер.
-    Для 10-значных (РФ) — '007'+num.
-    Для СНГ (11-13) — сам номер.
+    Всё, что короче 13 символов, добиваем нулями слева до 13.
+    13+ — оставляем как есть.
     """
     if not value or not str(value).isdigit():
         return ''
     s = str(value)
-    if len(s) == 10:
-        return '007' + s
+    if len(s) < 13:
+        return s.zfill(13)
     return s
 
 
@@ -287,9 +288,61 @@ def sys_set(ws_sys, key, value):
         logging.warning(f'{PREFIX}: sys_set({key}) fail: {e}')
 
 
-def push_rows(ws, rows):
-    if rows:
+def _make_key(row, key_cols, sep='|'):
+    return sep.join(str(row[c - 1]) for c in key_cols)
+
+
+def _existing_keys(ws, key_cols, sep='|'):
+    """
+    Множество уже существующих ключей в листе (без заголовка).
+    key_cols — список 1-based индексов колонок составного ключа.
+    """
+    try:
+        if len(key_cols) == 1:
+            vals = ws.col_values(key_cols[0])
+            return set(vals[1:])
+
+        all_vals = ws.get_all_values()
+        if not all_vals:
+            return set()
+        out = set()
+        for row in all_vals[1:]:
+            parts = [str(row[c - 1]) if c - 1 < len(row) else '' for c in key_cols]
+            out.add(sep.join(parts))
+        return out
+    except Exception as e:
+        logging.warning(f'{PREFIX}: не смог прочитать ключи из листа: {e}')
+        return set()
+
+
+def push_rows(ws, rows, key_cols=None, existing=None, sep='|'):
+    """
+    Дедуп внутри пакета + сквозной по листу.
+    key_cols — список 1-based индексов колонок составного ключа.
+    existing — set уже существующих ключей (обновляется вызывающей стороной).
+    Возвращает (добавлено, пропущено_дублей).
+    """
+    if not rows:
+        return 0, 0
+
+    if not key_cols:
         ws.append_rows(rows, value_input_option='RAW')
+        return len(rows), 0
+
+    seen = set()
+    uniq = []
+    skipped = 0
+    for r in rows:
+        k = _make_key(r, key_cols, sep)
+        if k in seen or (existing is not None and k in existing):
+            skipped += 1
+            continue
+        seen.add(k)
+        uniq.append(r)
+
+    if uniq:
+        ws.append_rows(uniq, value_input_option='RAW')
+    return len(uniq), skipped
 
 
 # ------------- rows builder -------------
@@ -331,20 +384,16 @@ def _build_rows(rows, kind, parsed_at):
                 parsed_at,
             ])
     else:
-        # СБП: чистим и нормализуем
+        # СБП: чистим, нормализуем, без ограничений по длине
         df['phone'] = df['phone'].astype(str).str.replace('[^0-9]', '', regex=True)
         df['value'] = df['phone'].map(normal_phone)
 
         before = len(df)
-        # 10-13 цифр — это номер. 14+ — карта (отсеиваем).
         df = df[df['value'].notna()]
-        df = df[df['value'].str.len().between(10, 13)]
         logging.info(
-            f'{PREFIX}: {kind}: после нормализации {len(df)}/{before} '
-            f'(длины 10-13)'
+            f'{PREFIX}: {kind}: после нормализации {len(df)}/{before}'
         )
 
-        # лог распределения длин
         if len(df) > 0:
             lengths = df['value'].str.len().value_counts().to_dict()
             logging.info(f'{PREFIX}: {kind}: длины номеров: {lengths}')
@@ -428,6 +477,14 @@ def run_shield(force_refresh=False, full=False):
         parsed_at = datetime.now(timezone.utc).isoformat()
         total_card = total_sbp = 0
 
+        # существующие ключи — читаем один раз перед вставкой
+        existing_card = _existing_keys(ws_card, CARD_KEY_COLS)
+        existing_sbp  = _existing_keys(ws_sbp,  SBP_KEY_COLS)
+        logging.info(
+            f'{PREFIX}: в листах уже: card={len(existing_card)}, '
+            f'sbp={len(existing_sbp)}'
+        )
+
         for sh in sheets:
             try:
                 kind = _detect_kind(sh['name'])
@@ -443,12 +500,29 @@ def run_shield(force_refresh=False, full=False):
                     )
                     continue
 
-                push_rows(ws_card if kind == 'card' else ws_sbp, rows)
                 if kind == 'card':
-                    total_card += len(rows)
+                    added, skipped = push_rows(
+                        ws_card, rows,
+                        key_cols=CARD_KEY_COLS, existing=existing_card
+                    )
+                    existing_card.update(
+                        _make_key(r, CARD_KEY_COLS) for r in rows
+                    )
+                    total_card += added
                 else:
-                    total_sbp += len(rows)
-                logging.info(f'{PREFIX}/{sh["name"]} ({kind}): +{len(rows)}')
+                    added, skipped = push_rows(
+                        ws_sbp, rows,
+                        key_cols=SBP_KEY_COLS, existing=existing_sbp
+                    )
+                    existing_sbp.update(
+                        _make_key(r, SBP_KEY_COLS) for r in rows
+                    )
+                    total_sbp += added
+
+                logging.info(
+                    f'{PREFIX}/{sh["name"]} ({kind}): +{added}, '
+                    f'дублей пропущено {skipped}'
+                )
 
             except Exception as e:
                 logging.error(f'{PREFIX}/{sh["name"]}: ошибка: {e}')
@@ -464,7 +538,6 @@ def run_shield(force_refresh=False, full=False):
         traceback.print_exc()
 
     finally:
-        # вернуть прежние значения
         MAX_ROWS_PER_SHEET = saved_rows
         HARD_MAX_BYTES     = saved_bytes
         logging.info(f'{PREFIX}: === конец ===')
